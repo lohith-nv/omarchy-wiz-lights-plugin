@@ -1,6 +1,6 @@
 # kshatriya-abhay.wiz-lights
 
-Smart home widget for [Philips WiZ](https://www.wiz.com/) bulbs on the local
+Smart home widget for [WiZ](https://www.wizconnected.com) bulbs (like Philips WiZ LED bulbs) on the local
 network, for the Omarchy shell (Quickshell).
 
 ![WiZ Lights plugin preview](preview.png)
