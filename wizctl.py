@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import sys
+import tempfile
 import time
 
 PORT = 38899
@@ -11,6 +12,10 @@ STATE_DIR = os.path.join(
     "wiz-lights",
 )
 STATE_FILE = os.path.join(STATE_DIR, "lights.json")
+
+MAX_LIGHTS = 64
+MAX_STATE_BYTES = 1 << 20
+MAX_FIELD_LEN = 128
 
 
 def udp_call(ip, payload, timeout=1.0):
@@ -34,28 +39,65 @@ def pilot(ip, retries=1):
     return None
 
 
+def clean_entry(entry):
+    if not isinstance(entry, dict):
+        return None
+    mac = entry.get("mac")
+    ip = entry.get("ip")
+    if not isinstance(mac, str) or not isinstance(ip, str) or not mac or not ip:
+        return None
+    mac = mac[:MAX_FIELD_LEN]
+    ip = ip[:MAX_FIELD_LEN]
+    name = entry.get("name")
+    name = name[:MAX_FIELD_LEN] if isinstance(name, str) else ""
+    module = entry.get("moduleName")
+    module = module[:MAX_FIELD_LEN] if isinstance(module, str) else ""
+    return {"mac": mac, "ip": ip, "name": name, "moduleName": module}
+
+
 def load_state():
     try:
-        with open(STATE_FILE) as fh:
-            data = json.load(fh)
-        if isinstance(data, dict) and isinstance(data.get("lights"), list):
-            return [
-                entry
-                for entry in data["lights"]
-                if isinstance(entry, dict) and entry.get("mac") and entry.get("ip")
-            ]
-    except (OSError, ValueError):
-        pass
-    return []
+        fd = os.open(STATE_FILE, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return []
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            raw = fh.read(MAX_STATE_BYTES + 1)
+    except OSError:
+        return []
+    if len(raw) > MAX_STATE_BYTES:
+        return []
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return []
+    if not isinstance(data, dict) or not isinstance(data.get("lights"), list):
+        return []
+    entries = []
+    for entry in data["lights"][:MAX_LIGHTS]:
+        cleaned = clean_entry(entry)
+        if cleaned:
+            entries.append(cleaned)
+    return entries
 
 
 def save_state(lights):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump({"lights": lights}, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, STATE_FILE)
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    bounded = [clean_entry(entry) for entry in lights[:MAX_LIGHTS]]
+    bounded = [entry for entry in bounded if entry]
+    fd, tmp = tempfile.mkstemp(prefix="lights.", suffix=".tmp", dir=STATE_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"lights": bounded}, fh, indent=2)
+            fh.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, STATE_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def default_name(entry):
@@ -68,9 +110,9 @@ def default_name(entry):
 
 def merge_discovered(saved, found):
     by_mac = {}
-    for entry in saved:
+    for entry in saved[:MAX_LIGHTS]:
         by_mac[entry["mac"]] = dict(entry)
-    for item in found:
+    for item in found[:MAX_LIGHTS]:
         existing = by_mac.get(item["mac"], {})
         by_mac[item["mac"]] = {
             "mac": item["mac"],
@@ -78,7 +120,7 @@ def merge_discovered(saved, found):
             "name": existing.get("name") or default_name(item),
             "moduleName": item.get("moduleName") or existing.get("moduleName") or "",
         }
-    return [by_mac[key] for key in sorted(by_mac)]
+    return [by_mac[key] for key in sorted(by_mac)][:MAX_LIGHTS]
 
 
 def local_ipv4():
@@ -141,7 +183,7 @@ def discover(timeout=1.5, rounds=3):
                 if not isinstance(result, dict) or not result.get("mac"):
                     continue
                 mac = result["mac"]
-                if mac not in found:
+                if mac not in found and len(found) < MAX_LIGHTS:
                     found[mac] = {
                         "mac": mac,
                         "ip": addr[0],
@@ -153,6 +195,8 @@ def discover(timeout=1.5, rounds=3):
 
 
 def status_snapshot(entries):
+    bounded = entries[:MAX_LIGHTS]
+
     def query(entry):
         result = pilot(entry["ip"])
         out = dict(entry)
@@ -179,7 +223,7 @@ def status_snapshot(entries):
         return out
 
     with futures.ThreadPoolExecutor(max_workers=8) as pool:
-        return list(pool.map(query, entries))
+        return list(pool.map(query, bounded))
 
 
 def emit(payload):
@@ -327,7 +371,7 @@ def main(argv):
             emit({"ok": False, "error": "usage: rename <mac> <name...>"})
             return 1
         mac = argv[2]
-        name = " ".join(argv[3:]).strip()
+        name = " ".join(argv[3:]).strip()[:MAX_FIELD_LEN]
         if not name:
             emit({"ok": False, "error": "empty name"})
             return 1
